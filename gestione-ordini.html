@@ -1,0 +1,928 @@
+<!DOCTYPE html>
+<html lang="it">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Gestione Ordini</title>
+
+<!--
+  ╔══════════════════════════════════════════════════════════╗
+  ║  CONFIGURAZIONE FIREBASE — DA FARE UNA VOLTA SOLA        ║
+  ║                                                          ║
+  ║  1. Vai su firebase.google.com                           ║
+  ║  2. Crea un progetto                                     ║
+  ║  3. Attiva: Authentication (metodo Email/Password)       ║
+  ║  4. Attiva: Firestore Database (modalità test)           ║
+  ║  5. Vai su Project Settings > Your apps > Web            ║
+  ║  6. Copia firebaseConfig e incollalo qui sotto           ║
+  ║  7. Leggi la guida Word allegata per tutti i dettagli    ║
+  ╚══════════════════════════════════════════════════════════╝
+-->
+
+<script type="module">
+// ─── INCOLLA QUI LA TUA CONFIGURAZIONE FIREBASE ───────────────
+// const firebaseConfig = {
+  apiKey: "AIzaSyCwFU34sE20Ep7s_nZsNnKbIKYt14HGXmo",
+  authDomain: "gestione-ordini-a371a.firebaseapp.com",
+  projectId: "gestione-ordini-a371a",
+  storageBucket: "gestione-ordini-a371a.firebasestorage.app",
+  messagingSenderId: "452959581057",
+  appId: "1:452959581057:web:15a811fd797c254c756e80"
+};
+
+// ──────────────────────────────────────────────────────────────
+
+import { initializeApp }
+  from "https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js";
+import { getAuth, signInWithEmailAndPassword, signOut, onAuthStateChanged, createUserWithEmailAndPassword }
+  from "https://www.gstatic.com/firebasejs/10.12.0/firebase-auth.js";
+import { getFirestore, collection, doc, addDoc, updateDoc, deleteDoc,
+         onSnapshot, query, orderBy, setDoc, getDoc, serverTimestamp }
+  from "https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js";
+
+// ── Controllo configurazione ──────────────────────────────────
+let app, auth, db;
+try {
+  if (typeof firebaseConfig === 'undefined' || firebaseConfig.apiKey.includes('...')) {
+    throw new Error('Firebase non configurato');
+  }
+  app  = initializeApp(firebaseConfig);
+  auth = getAuth(app);
+  db   = getFirestore(app);
+} catch(e) {
+  showConfigError();
+}
+
+// ── Stato globale ─────────────────────────────────────────────
+let currentUser  = null;   // { uid, email, role, displayName }
+let orders       = [];
+let pendingFiles = [];
+let unsubOrders  = null;
+
+// ═══════════════════════════════════════════════════════════════
+//  AUTH
+// ═══════════════════════════════════════════════════════════════
+onAuthStateChanged(auth, async (fbUser) => {
+  if (!fbUser) {
+    currentUser = null;
+    showScreen('login');
+    return;
+  }
+  // Leggi ruolo da Firestore
+  const snap = await getDoc(doc(db, 'users', fbUser.uid));
+  if (!snap.exists()) {
+    // utente non in Firestore → logout
+    await signOut(auth);
+    showLoginError('Account non trovato. Contatta l\'amministratore.');
+    return;
+  }
+  const data = snap.data();
+  currentUser = { uid: fbUser.uid, email: fbUser.email, role: data.role, displayName: data.displayName || fbUser.email };
+  bootApp();
+});
+
+// Converte nome utente in email fittizia per Firebase Auth
+function usernameToEmail(username) {
+  return username.toLowerCase().replace(/\s+/g, '.') + '@gestione-ordini.internal';
+}
+
+window.doLogin = async () => {
+  const username = document.getElementById('l-username').value.trim();
+  const pass     = document.getElementById('l-pass').value;
+  if (!username || !pass) return;
+  try {
+    document.getElementById('btn-login').disabled = true;
+    document.getElementById('btn-login').textContent = 'Accesso…';
+    const email = usernameToEmail(username);
+    await signInWithEmailAndPassword(auth, email, pass);
+  } catch(e) {
+    showLoginError(loginErrMsg(e.code));
+    document.getElementById('btn-login').disabled = false;
+    document.getElementById('btn-login').textContent = 'Accedi';
+  }
+};
+
+window.doLogout = async () => {
+  if (unsubOrders) unsubOrders();
+  await signOut(auth);
+};
+
+function loginErrMsg(code) {
+  if (code === 'auth/invalid-credential' || code === 'auth/wrong-password' || code === 'auth/user-not-found')
+    return 'Nome utente o password errati.';
+  if (code === 'auth/too-many-requests') return 'Troppi tentativi. Riprova tra qualche minuto.';
+  return 'Errore di accesso. Riprova.';
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  AVVIO APP DOPO LOGIN
+// ═══════════════════════════════════════════════════════════════
+function bootApp() {
+  document.getElementById('user-name').textContent  = currentUser.displayName;
+  document.getElementById('user-role').textContent  = currentUser.role === 'admin' ? '👑 Admin' : '👤 Utente';
+  document.getElementById('user-role').className    = 'role-badge ' + currentUser.role;
+
+  // Mostra/nascondi elementi admin
+  document.querySelectorAll('.admin-only').forEach(el => {
+    el.style.display = currentUser.role === 'admin' ? '' : 'none';
+  });
+
+  showScreen('app');
+  startOrdersListener();
+
+  const dateOpts = { weekday:'long', year:'numeric', month:'long', day:'numeric' };
+  document.getElementById('today-label').textContent = new Date().toLocaleDateString('it-IT', dateOpts);
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  ORDINI
+// ═══════════════════════════════════════════════════════════════
+function startOrdersListener() {
+  if (unsubOrders) unsubOrders();
+  const q = query(collection(db, 'ordini'), orderBy('createdAt', 'desc'));
+  unsubOrders = onSnapshot(q, snap => {
+    orders = snap.docs.map(d => ({ id: d.id, ...d.data() }));
+    renderOrders();
+  }, err => console.error('Firestore error:', err));
+}
+
+window.addOrder = async () => {
+  if (currentUser.role !== 'admin') return;
+  const num    = document.getElementById('f-num').value.trim();
+  const client = document.getElementById('f-client').value.trim();
+  const desc   = document.getElementById('f-desc').value.trim();
+  const date   = document.getElementById('f-date').value;
+  if (!client || !date) { alert('Inserisci almeno cliente e data di consegna.'); return; }
+
+  const order = {
+    num: num || ('#' + (orders.length + 1)),
+    client, desc, date,
+    stato: 'Da iniziare',
+    creato: new Date().toISOString().split('T')[0],
+    allegati: [...pendingFiles],
+    createdBy: currentUser.uid,
+    createdAt: serverTimestamp()
+  };
+  await addDoc(collection(db, 'ordini'), order);
+
+  ['f-num','f-client','f-desc','f-date'].forEach(id => document.getElementById(id).value = '');
+  pendingFiles = [];
+  updateFormAttPreview();
+  document.getElementById('f-files').value = '';
+};
+
+window.updateStato = async (id, val) => {
+  if (currentUser.role !== 'admin') return;
+  await updateDoc(doc(db, 'ordini', id), { stato: val, updatedAt: serverTimestamp() });
+};
+
+window.deleteOrder = async (id) => {
+  if (currentUser.role !== 'admin') return;
+  if (!confirm('Eliminare questo ordine?')) return;
+  await deleteDoc(doc(db, 'ordini', id));
+};
+
+window.addAttachmentToOrder = (id) => {
+  if (currentUser.role !== 'admin') return;
+  const input = document.createElement('input');
+  input.type = 'file'; input.multiple = true;
+  input.accept = 'image/*,.pdf,.dwg,.dxf,.svg';
+  input.onchange = () => {
+    const order = orders.find(o => o.id === id);
+    if (!order) return;
+    if (!order.allegati) order.allegati = [];
+    let loaded = 0;
+    Array.from(input.files).forEach(file => {
+      const reader = new FileReader();
+      reader.onload = async (e) => {
+        order.allegati.push({ name: file.name, type: file.type, data: e.target.result });
+        loaded++;
+        if (loaded === input.files.length) {
+          await updateDoc(doc(db, 'ordini', id), { allegati: order.allegati, updatedAt: serverTimestamp() });
+        }
+      };
+      reader.readAsDataURL(file);
+    });
+  };
+  input.click();
+};
+
+window.removeAttachment = async (orderId, attIdx) => {
+  if (currentUser.role !== 'admin') return;
+  if (!confirm('Rimuovere allegato?')) return;
+  const order = orders.find(o => o.id === orderId);
+  if (!order || !order.allegati) return;
+  order.allegati.splice(attIdx, 1);
+  await updateDoc(doc(db, 'ordini', orderId), { allegati: order.allegati, updatedAt: serverTimestamp() });
+};
+
+// ═══════════════════════════════════════════════════════════════
+//  GESTIONE UTENTI (solo admin)
+// ═══════════════════════════════════════════════════════════════
+let unsubUsers = null;
+
+window.openUsersPanel = () => {
+  if (currentUser.role !== 'admin') return;
+  document.getElementById('users-panel').classList.add('open');
+  loadUsers();
+};
+window.closeUsersPanel = () => {
+  document.getElementById('users-panel').classList.remove('open');
+  if (unsubUsers) { unsubUsers(); unsubUsers = null; }
+};
+
+function loadUsers() {
+  if (unsubUsers) unsubUsers();
+  unsubUsers = onSnapshot(collection(db, 'users'), snap => {
+    const users = snap.docs.map(d => ({ id: d.id, ...d.data() }));
+    renderUsersList(users);
+  });
+}
+
+function renderUsersList(users) {
+  const el = document.getElementById('users-list');
+  if (!users.length) { el.innerHTML = '<p class="no-users">Nessun utente registrato.</p>'; return; }
+  el.innerHTML = users.map(u => `
+    <div class="user-row ${u.id === currentUser.uid ? 'me' : ''}">
+      <div class="user-info">
+        <span class="user-avatar">${(u.displayName||'?')[0].toUpperCase()}</span>
+        <div>
+          <div class="user-dname">${u.displayName || '—'} ${u.id === currentUser.uid ? '<span class="you-tag">(tu)</span>':''}</div>
+          <div class="user-email">👤 ${u.username || '—'}</div>
+        </div>
+      </div>
+      <div class="user-actions">
+        <span class="role-pill ${u.role}">${u.role === 'admin' ? '👑 Admin' : '👤 Utente'}</span>
+        ${u.id !== currentUser.uid ? `
+          <button class="btn-role" onclick="toggleRole('${u.id}','${u.role}')">
+            ${u.role === 'admin' ? 'Rendi Utente' : 'Rendi Admin'}
+          </button>
+          <button class="btn-del-user" onclick="deleteUser('${u.id}','${u.displayName}')">🗑</button>
+        ` : ''}
+      </div>
+    </div>
+  `).join('');
+}
+
+window.toggleRole = async (uid, currentRole) => {
+  const newRole = currentRole === 'admin' ? 'user' : 'admin';
+  await updateDoc(doc(db, 'users', uid), { role: newRole });
+};
+
+window.deleteUser = async (uid, name) => {
+  if (!confirm(`Rimuovere l'utente "${name}" dall'app?\n\nNota: l'account email rimane attivo su Firebase, ma l'utente non potrà più accedere all'app.`)) return;
+  await deleteDoc(doc(db, 'users', uid));
+};
+
+window.createUser = async () => {
+  const name     = document.getElementById('nu-name').value.trim();
+  const username = document.getElementById('nu-username').value.trim().toLowerCase().replace(/\s+/g,'.');
+  const pass     = document.getElementById('nu-pass').value;
+  const role     = document.getElementById('nu-role').value;
+
+  if (!name || !username || !pass) { alert('Compila tutti i campi.'); return; }
+  if (pass.length < 6) { alert('La password deve essere di almeno 6 caratteri.'); return; }
+  if (!/^[a-z0-9._]+$/.test(username)) { alert('Il nome utente può contenere solo lettere, numeri, punti e underscore.'); return; }
+
+  const btn = document.getElementById('btn-create-user');
+  btn.disabled = true; btn.textContent = 'Creazione…';
+
+  const fakeEmail = usernameToEmail(username);
+
+  try {
+    // Crea utente su Firebase Auth con app secondaria per non sloggare l'admin
+    const secondApp = initializeApp(firebaseConfig, 'secondary-' + Date.now());
+    const secondAuth = getAuth(secondApp);
+    const cred = await createUserWithEmailAndPassword(secondAuth, fakeEmail, pass);
+    await signOut(secondAuth);
+
+    // Salva profilo in Firestore
+    await setDoc(doc(db, 'users', cred.user.uid), {
+      displayName: name,
+      username,
+      role,
+      createdAt: serverTimestamp(),
+      createdBy: currentUser.uid
+    });
+
+    ['nu-name','nu-username','nu-pass'].forEach(id => document.getElementById(id).value = '');
+    document.getElementById('nu-role').value = 'user';
+    document.getElementById('create-user-error').textContent = '';
+    document.getElementById('create-user-success').textContent = `✓ Utente "${name}" creato con successo.`;
+    setTimeout(() => document.getElementById('create-user-success').textContent = '', 4000);
+  } catch(e) {
+    let msg = 'Errore nella creazione.';
+    if (e.code === 'auth/email-already-in-use') msg = 'Nome utente già in uso. Scegline un altro.';
+    document.getElementById('create-user-error').textContent = msg;
+  } finally {
+    btn.disabled = false; btn.textContent = 'Crea Utente';
+  }
+};
+
+// ═══════════════════════════════════════════════════════════════
+//  ALLEGATI — FORM
+// ═══════════════════════════════════════════════════════════════
+window.dzDragOver  = (e) => { e.preventDefault(); document.getElementById('drop-zone').classList.add('drag-over'); };
+window.dzDragLeave = () => document.getElementById('drop-zone').classList.remove('drag-over');
+window.dzDrop      = (e) => { e.preventDefault(); document.getElementById('drop-zone').classList.remove('drag-over'); handleFiles(e.dataTransfer.files); };
+
+document.addEventListener('DOMContentLoaded', () => {
+  document.getElementById('f-files').addEventListener('change', function() { handleFiles(this.files); });
+  document.getElementById('l-pass').addEventListener('keydown', e => { if (e.key === 'Enter') doLogin(); });
+  document.getElementById('l-username').addEventListener('keydown', e => { if (e.key === 'Enter') doLogin(); });
+});
+
+function handleFiles(files) {
+  Array.from(files).forEach(file => {
+    const reader = new FileReader();
+    reader.onload = e => { pendingFiles.push({ name: file.name, type: file.type, data: e.target.result }); updateFormAttPreview(); };
+    reader.readAsDataURL(file);
+  });
+}
+function updateFormAttPreview() {
+  document.getElementById('form-att-preview').innerHTML = pendingFiles.map((f,i) => `
+    <div class="form-att-item">${fileIcon(f.type,f.name)} ${f.name}
+      <button onclick="pendingFiles.splice(${i},1); updateFormAttPreview()">✕</button>
+    </div>`).join('');
+}
+window.updateFormAttPreview = updateFormAttPreview;
+
+// ═══════════════════════════════════════════════════════════════
+//  MODALE ALLEGATI
+// ═══════════════════════════════════════════════════════════════
+window.openAttachment = (orderId, attIdx) => {
+  const order = orders.find(o => o.id === orderId);
+  if (!order) return;
+  const att = order.allegati[attIdx];
+  document.getElementById('modal-title').textContent = att.name;
+  const dl = document.getElementById('modal-download');
+  dl.href = att.data; dl.download = att.name;
+  const body = document.getElementById('modal-body');
+  if (att.type && att.type.startsWith('image/')) {
+    body.innerHTML = `<img src="${att.data}" alt="${att.name}">`;
+  } else if (att.type === 'application/pdf' || att.name.endsWith('.pdf')) {
+    body.innerHTML = `<iframe src="${att.data}#toolbar=1"></iframe>`;
+  } else {
+    body.innerHTML = `<div class="no-preview"><span class="big-icon">${fileIcon(att.type,att.name)}</span><p><strong>${att.name}</strong></p><p>Scarica il file per aprirlo.</p></div>`;
+  }
+  document.getElementById('modal').classList.add('open');
+};
+window.closeModal = () => document.getElementById('modal').classList.remove('open');
+window.closeModalOutside = e => { if (e.target.id === 'modal') closeModal(); };
+document.addEventListener('keydown', e => { if (e.key === 'Escape') closeModal(); });
+
+// ═══════════════════════════════════════════════════════════════
+//  FILTRI & RENDER
+// ═══════════════════════════════════════════════════════════════
+let activeFilter = 'tutti';
+window.setFilter = (f, btn) => {
+  activeFilter = f;
+  document.querySelectorAll('.filter-btn').forEach(b => b.classList.remove('active'));
+  btn.classList.add('active');
+  renderOrders();
+};
+
+function getDaysLeft(d) {
+  const t = new Date(); t.setHours(0,0,0,0);
+  const x = new Date(d+'T00:00:00'); x.setHours(0,0,0,0);
+  return Math.round((x-t)/86400000);
+}
+function urgCls(days, stato) {
+  if (stato==='Consegnato') return 'ok';
+  if (days<0) return 'scaduto'; if (days===0) return 'oggi';
+  if (days===1) return 'domani'; if (days<=3) return 'presto'; return 'ok';
+}
+function urgLbl(days, stato) {
+  if (stato==='Consegnato') return '✓ Consegnato';
+  if (days<0) return `⚠ ${Math.abs(days)} giorn${Math.abs(days)===1?'o':'i'} di ritardo`;
+  if (days===0) return '🔴 Oggi!'; if (days===1) return '🟡 Domani';
+  if (days<=3) return `🟠 Tra ${days} giorni`; return `🟢 Tra ${days} giorni`;
+}
+function fmtDate(s) {
+  if (!s) return '—';
+  return new Date(s+'T00:00:00').toLocaleDateString('it-IT',{day:'2-digit',month:'2-digit',year:'numeric'});
+}
+function fileIcon(type, name) {
+  if (type&&type.startsWith('image/')) return '🖼';
+  if (type==='application/pdf'||(name&&name.endsWith('.pdf'))) return '📄';
+  if (name&&(name.endsWith('.dwg')||name.endsWith('.dxf'))) return '📐';
+  if (name&&name.endsWith('.svg')) return '🎨'; return '📎';
+}
+
+function renderOrders() {
+  const search = (document.querySelector('.search-input')||{value:''}).value.toLowerCase();
+  const isAdmin = currentUser?.role === 'admin';
+
+  let filtered = orders.filter(o => {
+    const mf = activeFilter==='tutti' || o.stato===activeFilter;
+    const ms = !search || (o.client||'').toLowerCase().includes(search)
+      || (o.num||'').toLowerCase().includes(search) || (o.desc||'').toLowerCase().includes(search);
+    return mf && ms;
+  });
+  filtered.sort((a,b) => {
+    if (a.stato==='Consegnato' && b.stato!=='Consegnato') return 1;
+    if (b.stato==='Consegnato' && a.stato!=='Consegnato') return -1;
+    return new Date(a.date)-new Date(b.date);
+  });
+
+  const tot = orders.filter(o=>o.stato!=='Consegnato').length;
+  const sc  = orders.filter(o=>o.stato!=='Consegnato'&&getDaysLeft(o.date)<0).length;
+  const og  = orders.filter(o=>o.stato!=='Consegnato'&&getDaysLeft(o.date)===0).length;
+  const con = orders.filter(o=>o.stato==='Consegnato').length;
+
+  document.getElementById('stats').innerHTML = `
+    <div class="stat-box"><div class="stat-num">${tot}</div><div class="stat-label">In corso</div></div>
+    <div class="stat-box" style="border-color:var(--red)"><div class="stat-num" style="color:var(--red)">${sc}</div><div class="stat-label">In ritardo</div></div>
+    <div class="stat-box" style="border-color:#e07b00"><div class="stat-num" style="color:#e07b00">${og}</div><div class="stat-label">Oggi</div></div>
+    <div class="stat-box" style="border-color:var(--green)"><div class="stat-num" style="color:var(--green)">${con}</div><div class="stat-label">Consegnati</div></div>
+  `;
+
+  const list = document.getElementById('orders-list');
+  if (!filtered.length) { list.innerHTML = `<div class="empty-state"><span class="emoji">📭</span><p>Nessun ordine trovato.</p></div>`; return; }
+
+  list.innerHTML = filtered.map(o => {
+    const days = getDaysLeft(o.date);
+    const urg  = urgCls(days, o.stato);
+    const lbl  = urgLbl(days, o.stato);
+    const atts = o.allegati || [];
+
+    const statoEl = isAdmin
+      ? `<select class="stato-select" onchange="updateStato('${o.id}',this.value)">
+          <option ${o.stato==='Da iniziare'?'selected':''}>Da iniziare</option>
+          <option ${o.stato==='In lavorazione'?'selected':''}>In lavorazione</option>
+          <option ${o.stato==='Pronto'?'selected':''}>Pronto</option>
+          <option ${o.stato==='Consegnato'?'selected':''}>Consegnato</option>
+        </select>`
+      : `<span class="stato-badge stato-${urg}">${o.stato}</span>`;
+
+    const actionsEl = isAdmin
+      ? `<button class="btn-del" onclick="deleteOrder('${o.id}')" title="Elimina">🗑</button>`
+      : '';
+
+    const addAttBtn = isAdmin
+      ? `<button class="btn-add-att" onclick="addAttachmentToOrder('${o.id}')">＋ Aggiungi</button>` : '';
+
+    const attChips = atts.map((a,i) => `
+      <span class="att-chip" onclick="openAttachment('${o.id}',${i})" title="${a.name}">
+        ${fileIcon(a.type,a.name)} <span class="att-name">${a.name}</span>
+        ${isAdmin ? `<button class="att-del" onclick="event.stopPropagation();removeAttachment('${o.id}',${i})">✕</button>` : ''}
+      </span>`).join('');
+
+    return `
+      <div class="order-card">
+        <div class="card-main">
+          <div class="card-stripe stripe-${urg}"></div>
+          <div class="card-body">
+            <div class="order-top">
+              <span class="order-num">${o.num||''}</span>
+              <span class="order-client">${o.client||''}</span>
+              <span class="date-consegna ${urg}">${lbl}</span>
+            </div>
+            ${o.desc?`<div class="order-desc">${o.desc}</div>`:''}
+            <div class="order-dates">
+              <span class="date-item">📅 Inserito: <strong>${fmtDate(o.creato)}</strong></span>
+              <span class="date-item">🚚 Consegna: <strong>${fmtDate(o.date)}</strong></span>
+            </div>
+          </div>
+          <div class="card-actions">${statoEl}${actionsEl}</div>
+        </div>
+        <div class="card-attachments">
+          <span class="att-label">📎</span>
+          ${attChips}
+          ${addAttBtn}
+          ${!atts.length && !isAdmin ? '<span style="font-size:0.78rem;color:var(--ink-light);font-style:italic">Nessun allegato</span>' : ''}
+        </div>
+      </div>`;
+  }).join('');
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  UI HELPERS
+// ═══════════════════════════════════════════════════════════════
+function showScreen(name) {
+  document.querySelectorAll('.screen').forEach(s => s.classList.remove('active'));
+  document.getElementById('screen-'+name).classList.add('active');
+}
+function showLoginError(msg) {
+  const el = document.getElementById('login-error');
+  el.textContent = msg; el.style.display = 'block';
+}
+function showConfigError() {
+  document.getElementById('config-banner').style.display = 'flex';
+}
+
+document.querySelector('.search-input') &&
+  document.querySelector('.search-input').addEventListener('input', renderOrders);
+document.addEventListener('DOMContentLoaded', () => {
+  document.querySelector('.search-input')?.addEventListener('input', renderOrders);
+});
+
+</script>
+
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Syne:wght@400;700;800&family=DM+Sans:ital,wght@0,300;0,400;0,500;1,400&display=swap');
+
+:root {
+  --bg: #f2ede3; --surface: #fffdf7; --ink: #18150e; --ink-light: #6b6255;
+  --green: #2d6a4f; --green-light: #d8f3dc;
+  --yellow: #b5830a; --yellow-light: #fff3cd;
+  --red: #9b2335; --red-light: #fde8e8;
+  --border: #ddd8cc; --accent: #c84b31; --accent2: #1a3a5c;
+}
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+body { font-family: 'DM Sans', sans-serif; background: var(--bg); color: var(--ink); min-height: 100vh; }
+
+/* ── Screens ── */
+.screen { display: none; }
+.screen.active { display: block; }
+#screen-login { display: flex; min-height: 100vh; align-items: center; justify-content: center; background: var(--ink); }
+
+/* ── Config banner ── */
+#config-banner {
+  display: none; position: fixed; inset: 0; z-index: 9999;
+  background: #18150e; color: #f2ede3; align-items: center; justify-content: center; flex-direction: column; gap: 20px; padding: 40px; text-align: center;
+}
+#config-banner h2 { font-family: 'Syne', sans-serif; font-size: 1.5rem; color: var(--accent); }
+#config-banner p  { max-width: 520px; line-height: 1.7; opacity: 0.8; }
+#config-banner code { background: rgba(255,255,255,0.08); padding: 3px 8px; border-radius: 4px; font-size: 0.9rem; color: #ffd; }
+
+/* ═══════════════════════════════
+   LOGIN
+═══════════════════════════════ */
+.login-box {
+  background: var(--surface);
+  border-radius: 16px;
+  padding: 48px 44px;
+  width: 100%;
+  max-width: 420px;
+  box-shadow: 0 32px 80px rgba(0,0,0,0.45);
+}
+.login-logo { text-align: center; margin-bottom: 28px; }
+.login-logo .icon { font-size: 2.8rem; display: block; margin-bottom: 10px; }
+.login-logo h1 { font-family: 'Syne', sans-serif; font-size: 1.5rem; font-weight: 800; }
+.login-logo p  { font-size: 0.82rem; color: var(--ink-light); margin-top: 4px; }
+
+.login-field { margin-bottom: 16px; }
+.login-field label { display: block; font-size: 0.72rem; font-weight: 500; color: var(--ink-light); margin-bottom: 6px; text-transform: uppercase; letter-spacing: 0.5px; }
+.login-field input { width: 100%; padding: 11px 14px; border: 2px solid var(--border); border-radius: 8px; font-family: 'DM Sans', sans-serif; font-size: 0.95rem; background: var(--bg); color: var(--ink); outline: none; transition: border-color 0.2s; }
+.login-field input:focus { border-color: var(--accent); }
+
+.btn-login { width: 100%; padding: 12px; background: var(--accent); color: white; border: none; border-radius: 8px; font-family: 'Syne', sans-serif; font-weight: 700; font-size: 1rem; cursor: pointer; margin-top: 8px; letter-spacing: 0.5px; transition: background 0.2s; }
+.btn-login:hover:not(:disabled) { background: #a83a20; }
+.btn-login:disabled { opacity: 0.6; cursor: default; }
+
+#login-error { display: none; background: var(--red-light); color: var(--red); border-radius: 7px; padding: 10px 14px; font-size: 0.85rem; margin-top: 14px; font-weight: 500; }
+
+/* ═══════════════════════════════
+   APP HEADER
+═══════════════════════════════ */
+header {
+  background: var(--ink); color: var(--bg);
+  padding: 14px 28px;
+  display: flex; align-items: center; justify-content: space-between; gap: 16px; flex-wrap: wrap;
+  border-bottom: 4px solid var(--accent);
+  position: sticky; top: 0; z-index: 100;
+}
+header h1 { font-family: 'Syne', sans-serif; font-size: 1.4rem; font-weight: 800; letter-spacing: -0.5px; }
+.header-right { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; }
+.user-chip { display: flex; align-items: center; gap: 8px; background: rgba(255,255,255,0.08); border-radius: 24px; padding: 5px 14px 5px 5px; }
+.user-avatar-hdr { width: 30px; height: 30px; border-radius: 50%; background: var(--accent); display: flex; align-items: center; justify-content: center; font-weight: 700; font-size: 0.85rem; color: white; }
+.user-chip-name { font-size: 0.85rem; font-weight: 500; }
+.role-badge { font-size: 0.72rem; padding: 2px 8px; border-radius: 10px; font-weight: 600; }
+.role-badge.admin { background: rgba(200,75,49,0.3); color: #ffb3a0; }
+.role-badge.user  { background: rgba(45,106,79,0.3); color: #a8e6c2; }
+.btn-logout { background: none; border: 1px solid rgba(255,255,255,0.25); border-radius: 6px; color: rgba(255,255,255,0.7); padding: 5px 12px; font-family: 'DM Sans', sans-serif; font-size: 0.8rem; cursor: pointer; transition: all 0.15s; }
+.btn-logout:hover { border-color: rgba(255,255,255,0.6); color: white; }
+.btn-users { background: var(--accent); border: none; border-radius: 6px; color: white; padding: 6px 14px; font-family: 'Syne', sans-serif; font-weight: 700; font-size: 0.8rem; cursor: pointer; letter-spacing: 0.5px; transition: background 0.15s; }
+.btn-users:hover { background: #a83a20; }
+.date-hdr { font-size: 0.78rem; opacity: 0.5; }
+
+/* ═══════════════════════════════
+   LAYOUT
+═══════════════════════════════ */
+.container { max-width: 1080px; margin: 0 auto; padding: 24px 20px; }
+
+.legend { display: flex; gap: 14px; margin-bottom: 20px; flex-wrap: wrap; }
+.legend-item { display: flex; align-items: center; gap: 6px; font-size: 0.8rem; color: var(--ink-light); }
+.legend-dot { width: 10px; height: 10px; border-radius: 50%; }
+
+/* ── Stats ── */
+.stats { display: flex; gap: 12px; margin-bottom: 22px; flex-wrap: wrap; }
+.stat-box { background: var(--surface); border: 2px solid var(--border); border-radius: 8px; padding: 12px 18px; text-align: center; min-width: 100px; }
+.stat-num { font-family: 'Syne', sans-serif; font-size: 1.7rem; font-weight: 800; line-height: 1; }
+.stat-label { font-size: 0.7rem; color: var(--ink-light); text-transform: uppercase; letter-spacing: 0.5px; margin-top: 3px; }
+
+/* ── Add panel (admin only) ── */
+.add-panel { background: var(--surface); border: 2px solid var(--border); border-radius: 12px; padding: 22px; margin-bottom: 24px; }
+.add-panel h2 { font-family: 'Syne', sans-serif; font-size: 0.9rem; font-weight: 700; margin-bottom: 14px; text-transform: uppercase; letter-spacing: 1px; color: var(--ink-light); }
+.form-grid { display: grid; grid-template-columns: 1fr 1fr 1.4fr 1fr; gap: 11px; align-items: end; margin-bottom: 12px; }
+.form-bottom { display: grid; grid-template-columns: 1fr auto; gap: 12px; align-items: end; }
+.field label { display: block; font-size: 0.7rem; font-weight: 500; color: var(--ink-light); margin-bottom: 5px; text-transform: uppercase; letter-spacing: 0.5px; }
+.field input { width: 100%; padding: 9px 12px; border: 2px solid var(--border); border-radius: 7px; font-family: 'DM Sans', sans-serif; font-size: 0.88rem; background: white; color: var(--ink); outline: none; transition: border-color 0.2s; }
+.field input:focus { border-color: var(--ink); }
+
+.drop-zone { border: 2px dashed var(--border); border-radius: 8px; padding: 12px 18px; display: flex; align-items: center; gap: 10px; cursor: pointer; transition: all 0.2s; background: white; color: var(--ink-light); font-size: 0.84rem; }
+.drop-zone:hover, .drop-zone.drag-over { border-color: var(--accent); background: #fff5f3; color: var(--accent); }
+.drop-zone input { display: none; }
+.form-attachments { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 8px; }
+.form-att-item { display: flex; align-items: center; gap: 6px; background: var(--bg); border: 1px solid var(--border); border-radius: 6px; padding: 4px 10px; font-size: 0.76rem; }
+.form-att-item button { background: none; border: none; cursor: pointer; color: var(--ink-light); }
+.form-att-item button:hover { color: var(--red); }
+.btn-add { background: var(--accent); color: white; border: none; border-radius: 7px; padding: 10px 22px; font-family: 'Syne', sans-serif; font-weight: 700; font-size: 0.88rem; cursor: pointer; transition: background 0.2s; white-space: nowrap; }
+.btn-add:hover { background: #a83a20; }
+
+/* ── Filtri ── */
+.filters { display: flex; gap: 8px; margin-bottom: 16px; flex-wrap: wrap; align-items: center; }
+.filter-btn { padding: 6px 14px; border-radius: 20px; border: 2px solid var(--border); background: white; font-family: 'DM Sans', sans-serif; font-size: 0.8rem; font-weight: 500; cursor: pointer; transition: all 0.15s; color: var(--ink-light); }
+.filter-btn.active { background: var(--ink); border-color: var(--ink); color: white; }
+.filter-btn:hover:not(.active) { border-color: var(--ink); color: var(--ink); }
+.search-input { margin-left: auto; padding: 6px 14px; border: 2px solid var(--border); border-radius: 20px; font-family: 'DM Sans', sans-serif; font-size: 0.82rem; outline: none; transition: border-color 0.2s; background: white; }
+.search-input:focus { border-color: var(--ink); }
+
+/* ── Cards ── */
+.orders-list { display: flex; flex-direction: column; gap: 9px; }
+.order-card { background: var(--surface); border: 2px solid var(--border); border-radius: 10px; overflow: hidden; transition: box-shadow 0.2s, transform 0.15s; animation: slideIn 0.22s ease; }
+@keyframes slideIn { from{opacity:0;transform:translateY(-7px)} to{opacity:1;transform:translateY(0)} }
+.order-card:hover { box-shadow: 0 4px 18px rgba(0,0,0,0.08); transform: translateY(-1px); }
+.card-main { display: grid; grid-template-columns: 6px 1fr auto; gap: 0 14px; align-items: center; padding: 14px 18px; }
+.card-stripe { width: 6px; border-radius: 3px; min-height: 56px; align-self: stretch; }
+.card-actions { display: flex; gap: 8px; align-items: center; }
+.order-top { display: flex; align-items: baseline; gap: 10px; margin-bottom: 5px; flex-wrap: wrap; }
+.order-num { font-family: 'Syne', sans-serif; font-weight: 800; font-size: 0.95rem; color: var(--accent); }
+.order-client { font-weight: 500; font-size: 0.95rem; }
+.order-desc { font-size: 0.82rem; color: var(--ink-light); margin-bottom: 6px; }
+.order-dates { display: flex; gap: 18px; font-size: 0.78rem; flex-wrap: wrap; }
+.date-item { display: flex; align-items: center; gap: 4px; color: var(--ink-light); }
+.date-item strong { color: var(--ink); }
+.date-consegna { font-family: 'Syne', sans-serif; font-weight: 700; font-size: 0.82rem; padding: 3px 10px; border-radius: 5px; display: inline-flex; align-items: center; gap: 4px; }
+.stato-select { font-family: 'DM Sans', sans-serif; font-size: 0.76rem; border: 2px solid var(--border); border-radius: 6px; padding: 5px 8px; background: white; cursor: pointer; outline: none; font-weight: 500; }
+.stato-badge { font-size: 0.75rem; font-weight: 600; padding: 4px 10px; border-radius: 6px; background: var(--bg); color: var(--ink-light); border: 1px solid var(--border); }
+.btn-del { background: none; border: 2px solid var(--border); border-radius: 6px; width: 31px; height: 31px; cursor: pointer; display: flex; align-items: center; justify-content: center; font-size: 0.95rem; color: var(--ink-light); transition: all 0.15s; }
+.btn-del:hover { border-color: var(--red); color: var(--red); background: var(--red-light); }
+.card-attachments { border-top: 1px solid var(--border); padding: 9px 18px 9px 38px; display: flex; gap: 7px; flex-wrap: wrap; align-items: center; background: #faf8f3; }
+.att-label { font-size: 0.7rem; color: var(--ink-light); text-transform: uppercase; letter-spacing: 0.5px; }
+.att-chip { display: inline-flex; align-items: center; gap: 5px; background: white; border: 1px solid var(--border); border-radius: 5px; padding: 3px 9px; font-size: 0.76rem; cursor: pointer; transition: all 0.15s; max-width: 190px; }
+.att-chip:hover { border-color: var(--accent); color: var(--accent); background: #fff5f3; }
+.att-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.btn-add-att { background: none; border: 1px dashed var(--border); border-radius: 5px; padding: 3px 9px; font-size: 0.76rem; color: var(--ink-light); cursor: pointer; transition: all 0.15s; }
+.btn-add-att:hover { border-color: var(--accent); color: var(--accent); }
+.att-del { background: none; border: none; cursor: pointer; color: var(--ink-light); font-size: 0.72rem; padding: 0; margin-left: 2px; }
+.att-del:hover { color: var(--red); }
+
+.scaduto{background:var(--red-light);color:var(--red)} .oggi{background:#fff0e0;color:#c84b00}
+.domani{background:var(--yellow-light);color:var(--yellow)} .presto{background:#fff9e0;color:#8a6e00}
+.ok{background:var(--green-light);color:var(--green)}
+.stripe-scaduto{background:var(--red)} .stripe-oggi{background:#e07b00}
+.stripe-domani{background:var(--yellow)} .stripe-presto{background:#c8aa00} .stripe-ok{background:var(--green)}
+
+.empty-state { text-align: center; padding: 56px 20px; color: var(--ink-light); }
+.empty-state .emoji { font-size: 2.8rem; display: block; margin-bottom: 12px; }
+
+/* ═══════════════════════════════
+   PANNELLO UTENTI
+═══════════════════════════════ */
+.panel-overlay { display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.55); z-index: 500; }
+.panel-overlay.open { display: flex; align-items: flex-start; justify-content: flex-end; }
+.panel { background: var(--surface); width: 100%; max-width: 520px; height: 100vh; overflow-y: auto; display: flex; flex-direction: column; box-shadow: -12px 0 40px rgba(0,0,0,0.2); }
+.panel-header { background: var(--accent2); color: white; padding: 20px 24px; display: flex; align-items: center; justify-content: space-between; flex-shrink: 0; }
+.panel-header h2 { font-family: 'Syne', sans-serif; font-size: 1.1rem; font-weight: 800; }
+.btn-close-panel { background: none; border: 1px solid rgba(255,255,255,0.3); border-radius: 6px; color: white; cursor: pointer; padding: 5px 12px; font-size: 0.82rem; }
+.btn-close-panel:hover { background: rgba(255,255,255,0.1); }
+.panel-body { flex: 1; padding: 24px; display: flex; flex-direction: column; gap: 28px; }
+
+/* Form crea utente */
+.create-user-form { background: var(--bg); border-radius: 10px; padding: 18px; border: 2px solid var(--border); }
+.create-user-form h3 { font-family: 'Syne', sans-serif; font-size: 0.88rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.8px; color: var(--ink-light); margin-bottom: 14px; }
+.cu-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 10px; }
+.cu-field label { display: block; font-size: 0.68rem; font-weight: 500; color: var(--ink-light); margin-bottom: 4px; text-transform: uppercase; letter-spacing: 0.5px; }
+.cu-field input, .cu-field select { width: 100%; padding: 8px 10px; border: 2px solid var(--border); border-radius: 6px; font-family: 'DM Sans', sans-serif; font-size: 0.85rem; background: white; color: var(--ink); outline: none; transition: border-color 0.2s; }
+.cu-field input:focus, .cu-field select:focus { border-color: var(--accent2); }
+.cu-full { grid-column: 1 / -1; }
+.btn-create-user { width: 100%; padding: 10px; background: var(--accent2); color: white; border: none; border-radius: 7px; font-family: 'Syne', sans-serif; font-weight: 700; font-size: 0.88rem; cursor: pointer; transition: background 0.2s; margin-top: 4px; letter-spacing: 0.5px; }
+.btn-create-user:hover:not(:disabled) { background: #0f2540; }
+.btn-create-user:disabled { opacity: 0.6; cursor: default; }
+#create-user-error { color: var(--red); font-size: 0.8rem; margin-top: 8px; font-weight: 500; }
+#create-user-success { color: var(--green); font-size: 0.8rem; margin-top: 8px; font-weight: 500; }
+
+/* Lista utenti */
+.users-section h3 { font-family: 'Syne', sans-serif; font-size: 0.88rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.8px; color: var(--ink-light); margin-bottom: 12px; }
+.user-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 12px 14px; background: white; border: 1px solid var(--border); border-radius: 8px; margin-bottom: 8px; flex-wrap: wrap; }
+.user-row.me { border-color: var(--accent2); background: #f0f5ff; }
+.user-info { display: flex; align-items: center; gap: 10px; }
+.user-avatar { width: 36px; height: 36px; border-radius: 50%; background: var(--accent2); color: white; display: flex; align-items: center; justify-content: center; font-weight: 700; font-size: 0.95rem; flex-shrink: 0; }
+.user-dname { font-weight: 500; font-size: 0.88rem; }
+.user-email { font-size: 0.75rem; color: var(--ink-light); }
+.you-tag { font-size: 0.7rem; color: var(--accent2); font-weight: 400; }
+.user-actions { display: flex; align-items: center; gap: 7px; flex-wrap: wrap; }
+.role-pill { font-size: 0.72rem; font-weight: 600; padding: 3px 10px; border-radius: 12px; }
+.role-pill.admin { background: rgba(200,75,49,0.12); color: var(--accent); border: 1px solid rgba(200,75,49,0.25); }
+.role-pill.user  { background: rgba(45,106,79,0.1); color: var(--green); border: 1px solid rgba(45,106,79,0.2); }
+.btn-role { background: none; border: 1px solid var(--border); border-radius: 5px; padding: 4px 10px; font-family: 'DM Sans', sans-serif; font-size: 0.74rem; cursor: pointer; color: var(--ink-light); transition: all 0.15s; }
+.btn-role:hover { border-color: var(--accent2); color: var(--accent2); }
+.btn-del-user { background: none; border: 1px solid var(--border); border-radius: 5px; width: 28px; height: 28px; cursor: pointer; font-size: 0.85rem; color: var(--ink-light); transition: all 0.15s; }
+.btn-del-user:hover { border-color: var(--red); color: var(--red); background: var(--red-light); }
+.no-users { font-size: 0.85rem; color: var(--ink-light); font-style: italic; }
+
+/* ═══════════════════════════════
+   MODALE ALLEGATI
+═══════════════════════════════ */
+.modal-overlay { display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.78); z-index: 1000; align-items: center; justify-content: center; }
+.modal-overlay.open { display: flex; }
+.modal { background: var(--surface); border-radius: 12px; max-width: 92vw; max-height: 92vh; width: 860px; display: flex; flex-direction: column; overflow: hidden; box-shadow: 0 24px 70px rgba(0,0,0,0.45); }
+.modal-header { display: flex; align-items: center; justify-content: space-between; padding: 13px 20px; border-bottom: 2px solid var(--border); background: var(--ink); color: white; gap: 12px; }
+.modal-header h3 { font-family: 'Syne', sans-serif; font-size: 0.9rem; font-weight: 700; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.modal-close { background: none; border: 2px solid rgba(255,255,255,0.3); border-radius: 6px; color: white; cursor: pointer; padding: 4px 12px; font-size: 0.82rem; flex-shrink: 0; }
+.modal-close:hover { background: rgba(255,255,255,0.15); }
+.modal-body { flex: 1; overflow: auto; padding: 22px; display: flex; align-items: center; justify-content: center; background: #ede9e0; }
+.modal-body img { max-width: 100%; max-height: 68vh; border-radius: 6px; object-fit: contain; box-shadow: 0 4px 24px rgba(0,0,0,0.18); }
+.modal-body iframe { width: 100%; height: 68vh; border: none; border-radius: 6px; background: white; }
+.no-preview { text-align: center; color: var(--ink-light); padding: 40px; background: white; border-radius: 10px; }
+.no-preview .big-icon { font-size: 3.2rem; display: block; margin-bottom: 14px; }
+.modal-footer { padding: 11px 20px; border-top: 1px solid var(--border); display: flex; justify-content: flex-end; background: var(--surface); }
+.btn-download { background: var(--accent); color: white; border: none; border-radius: 7px; padding: 8px 18px; font-family: 'Syne', sans-serif; font-weight: 700; font-size: 0.84rem; cursor: pointer; text-decoration: none; display: inline-flex; align-items: center; gap: 6px; }
+.btn-download:hover { background: #a83a20; }
+
+@media (max-width: 720px) {
+  .form-grid { grid-template-columns: 1fr 1fr; }
+  .form-bottom { grid-template-columns: 1fr; }
+  .card-main { grid-template-columns: 5px 1fr; }
+  .card-actions { grid-column: 2; margin-top: 8px; }
+  .card-attachments { padding-left: 18px; }
+  .filters { gap: 6px; }
+  .cu-grid { grid-template-columns: 1fr; }
+  header { padding: 12px 16px; }
+  .panel { max-width: 100%; }
+}
+</style>
+</head>
+<body>
+
+<!-- ══ CONFIG ERROR ══════════════════════════════════════════ -->
+<div id="config-banner">
+  <h2>⚙️ Firebase non configurato</h2>
+  <p>Per usare questa app devi incollare le credenziali Firebase nel file HTML.<br>
+  Cerca la sezione <code>INCOLLA QUI LA TUA CONFIGURAZIONE FIREBASE</code> nel codice e segui la guida Word allegata.</p>
+</div>
+
+<!-- ══ SCHERMATA LOGIN ═══════════════════════════════════════ -->
+<div id="screen-login" class="screen active">
+  <div class="login-box">
+    <div class="login-logo">
+      <span class="icon">📋</span>
+      <h1>Gestione Ordini</h1>
+      <p>Accedi con il tuo nome utente</p>
+    </div>
+    <div class="login-field">
+      <label>Nome utente</label>
+      <input type="text" id="l-username" placeholder="es. mario.rossi" autocomplete="username" autocapitalize="none">
+    </div>
+    <div class="login-field">
+      <label>Password</label>
+      <input type="password" id="l-pass" placeholder="••••••••" autocomplete="current-password">
+    </div>
+    <button class="btn-login" id="btn-login" onclick="doLogin()">Accedi</button>
+    <div id="login-error"></div>
+  </div>
+</div>
+
+<!-- ══ SCHERMATA APP ══════════════════════════════════════════ -->
+<div id="screen-app" class="screen">
+
+  <header>
+    <h1>📋 Gestione Ordini</h1>
+    <div class="header-right">
+      <span class="date-hdr" id="today-label"></span>
+      <button class="btn-users admin-only" onclick="openUsersPanel()">👥 Utenti</button>
+      <div class="user-chip">
+        <div class="user-avatar-hdr" id="user-initial">?</div>
+        <div>
+          <div class="user-chip-name" id="user-name">—</div>
+          <div id="user-role" class="role-badge">—</div>
+        </div>
+      </div>
+      <button class="btn-logout" onclick="doLogout()">Esci</button>
+    </div>
+  </header>
+
+  <div class="container">
+
+    <div class="legend">
+      <div class="legend-item"><div class="legend-dot" style="background:var(--red)"></div>In ritardo</div>
+      <div class="legend-item"><div class="legend-dot" style="background:#e07b00"></div>Oggi</div>
+      <div class="legend-item"><div class="legend-dot" style="background:var(--yellow)"></div>Domani</div>
+      <div class="legend-item"><div class="legend-dot" style="background:#c8aa00"></div>Entro 3 gg</div>
+      <div class="legend-item"><div class="legend-dot" style="background:var(--green)"></div>OK</div>
+    </div>
+
+    <div class="stats" id="stats"></div>
+
+    <!-- FORM NUOVO ORDINE (solo admin) -->
+    <div class="add-panel admin-only">
+      <h2>➕ Nuovo Ordine</h2>
+      <div class="form-grid">
+        <div class="field"><label>N° Ordine</label><input type="text" id="f-num" placeholder="es. 2024-001"></div>
+        <div class="field"><label>Cliente</label><input type="text" id="f-client" placeholder="Nome cliente"></div>
+        <div class="field"><label>Descrizione lavorazione</label><input type="text" id="f-desc" placeholder="es. Taglio lamiera..."></div>
+        <div class="field"><label>Data consegna</label><input type="date" id="f-date"></div>
+      </div>
+      <div class="form-bottom">
+        <div>
+          <label style="display:block;font-size:0.7rem;font-weight:500;color:var(--ink-light);margin-bottom:6px;text-transform:uppercase;letter-spacing:0.5px;">📎 Allegati — disegni, PDF, immagini</label>
+          <div class="drop-zone" id="drop-zone" onclick="document.getElementById('f-files').click()" ondragover="dzDragOver(event)" ondragleave="dzDragLeave(event)" ondrop="dzDrop(event)">
+            <span style="font-size:1.3rem">🗂</span>
+            <span>Clicca oppure trascina i file da allegare</span>
+            <input type="file" id="f-files" multiple accept="image/*,.pdf,.dwg,.dxf,.svg">
+          </div>
+          <div class="form-attachments" id="form-att-preview"></div>
+        </div>
+        <button class="btn-add" onclick="addOrder()">AGGIUNGI<br>ORDINE</button>
+      </div>
+    </div>
+
+    <!-- FILTRI -->
+    <div class="filters">
+      <button class="filter-btn active" onclick="setFilter('tutti',this)">Tutti</button>
+      <button class="filter-btn" onclick="setFilter('Da iniziare',this)">Da iniziare</button>
+      <button class="filter-btn" onclick="setFilter('In lavorazione',this)">In lavorazione</button>
+      <button class="filter-btn" onclick="setFilter('Pronto',this)">Pronti</button>
+      <button class="filter-btn" onclick="setFilter('Consegnato',this)">Consegnati</button>
+      <input class="search-input" type="text" placeholder="🔍 Cerca…">
+    </div>
+
+    <div class="orders-list" id="orders-list">
+      <div class="empty-state"><span class="emoji">⏳</span><p>Caricamento ordini…</p></div>
+    </div>
+
+  </div>
+</div>
+
+<!-- ══ PANNELLO UTENTI ════════════════════════════════════════ -->
+<div class="panel-overlay" id="users-panel" onclick="closePanelOutside(event)">
+  <div class="panel" onclick="event.stopPropagation()">
+    <div class="panel-header">
+      <h2>👥 Gestione Utenti</h2>
+      <button class="btn-close-panel" onclick="closeUsersPanel()">✕ Chiudi</button>
+    </div>
+    <div class="panel-body">
+
+      <!-- Crea utente -->
+      <div class="create-user-form">
+        <h3>➕ Crea nuovo utente</h3>
+        <div class="cu-grid">
+          <div class="cu-field">
+            <label>Nome completo</label>
+            <input type="text" id="nu-name" placeholder="Mario Rossi">
+          </div>
+          <div class="cu-field">
+            <label>Ruolo</label>
+            <select id="nu-role">
+              <option value="user">👤 Utente</option>
+              <option value="admin">👑 Admin</option>
+            </select>
+          </div>
+          <div class="cu-field cu-full">
+            <label>Nome utente (per il login)</label>
+            <input type="text" id="nu-username" placeholder="es. mario.rossi" autocapitalize="none">
+          </div>
+          <div class="cu-field cu-full">
+            <label>Password (min. 6 caratteri)</label>
+            <input type="password" id="nu-pass" placeholder="••••••••">
+          </div>
+        </div>
+        <button class="btn-create-user" id="btn-create-user" onclick="createUser()">Crea Utente</button>
+        <div id="create-user-error"></div>
+        <div id="create-user-success"></div>
+      </div>
+
+      <!-- Lista utenti -->
+      <div class="users-section">
+        <h3>Utenti registrati</h3>
+        <div id="users-list"></div>
+      </div>
+
+    </div>
+  </div>
+</div>
+
+<!-- ══ MODALE ALLEGATI ════════════════════════════════════════ -->
+<div class="modal-overlay" id="modal" onclick="closeModalOutside(event)">
+  <div class="modal">
+    <div class="modal-header">
+      <h3 id="modal-title">Allegato</h3>
+      <button class="modal-close" onclick="closeModal()">✕ Chiudi</button>
+    </div>
+    <div class="modal-body" id="modal-body"></div>
+    <div class="modal-footer">
+      <a class="btn-download" id="modal-download" download>⬇ Scarica file</a>
+    </div>
+  </div>
+</div>
+
+<script>
+window.closePanelOutside = (e) => {
+  if (e.target.id === 'users-panel') closeUsersPanel();
+};
+</script>
+
+</body>
+</html>
